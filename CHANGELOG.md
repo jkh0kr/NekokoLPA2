@@ -2,7 +2,7 @@
 
 All notable changes to NekokoLPA2 will be documented in this file.
 
-## [2.0.26] - 2026-01-14
+## [2.0.0+26] - 2026-01-14
 
 ### Added
 - **Custom Profile Icons**: Set custom icons for profiles from gallery, remote Nekoko icons, or eSIM card icons
