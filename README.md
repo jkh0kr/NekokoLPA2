@@ -19,6 +19,7 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed version history and release notes.
 
 - **Android**: [GitHub Releases](https://github.com/iebb/NekokoLPA2/releases)
 - **iOS/macOS**: [TestFlight](https://testflight.apple.com/join/bP38fzC4)
+- **Windows**: [GitHub Releases](https://github.com/iebb/NekokoLPA2/releases)
 - **Web**: [web.lpa.ee](https://web.lpa.ee) 
 
 ## Support
