@@ -2,6 +2,12 @@
 
 All notable changes to NekokoLPA2 will be documented in this file.
 
+## [2.0.0+28] - 2026-01-15
+
+### Added
+- **Multi-Language Support**: Added support for Spanish, French, Japanese, and Chinese.
+- **Bluetooth-on-Windows Support**: Added support for Bluetooth on Windows.
+
 ## [2.0.0+27] - 2026-01-14
 
 ### Added
