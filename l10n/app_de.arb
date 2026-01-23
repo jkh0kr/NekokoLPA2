@@ -509,6 +509,8 @@
   "manage": "Verwalten",
   "buyCard": "Karte",
   "buyData": "Daten",
-  "selectDevice": "Gerät auswählen"
+  "selectDevice": "Gerät auswählen",
+  "estimatedDownloadSize": "Geschätzte Download-Größe",
+  "insufficientStorageWarning": "Unzureichender Speicherplatz für die Installation. Die Installation könnte fehlschlagen."
 }
 

@@ -382,6 +382,8 @@
   "noNotifications": "No hay notificaciones",
   "manage": "Gestionar",
   "buyCard": "Tarjeta",
-  "buyData": "Datos"
+  "buyData": "Datos",
+  "estimatedDownloadSize": "Tamaño de descarga estimado",
+  "insufficientStorageWarning": "Espacio de almacenamiento insuficiente para la instalación. La instalación podría fallar."
 }
 

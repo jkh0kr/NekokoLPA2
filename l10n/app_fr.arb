@@ -380,6 +380,8 @@
   "noNotifications": "Aucune notification",
   "manage": "Gérer",
   "buyCard": "Carte",
-  "buyData": "Données"
+  "buyData": "Données",
+  "estimatedDownloadSize": "Estimated download size",
+  "insufficientStorageWarning": "Insufficient storage for installation. Installation might fail."
 }
 

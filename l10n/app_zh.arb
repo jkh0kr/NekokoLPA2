@@ -788,5 +788,7 @@
   "sortNickname": "昵称",
   "showProfileSearch": "显示配置搜索",
   "showProfileSearchSubtitle": "在配置列表中显示搜索和排序栏",
-  "profilesInstalled": "已安装 {count} 个配置"
+  "profilesInstalled": "已安装 {count} 个配置",
+  "estimatedDownloadSize": "预估下载大小",
+  "insufficientStorageWarning": "可用空间不足，安装可能会失败。"
 }

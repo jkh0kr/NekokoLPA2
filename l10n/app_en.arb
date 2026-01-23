@@ -691,5 +691,7 @@
         "type": "int"
       }
     }
-  }
+  },
+  "estimatedDownloadSize": "Estimated download size",
+  "insufficientStorageWarning": "Insufficient storage for installation. Installation might fail."
 }

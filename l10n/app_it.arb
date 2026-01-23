@@ -508,6 +508,8 @@
   "message": "Messaggio",
   "manage": "Gestisci",
   "buyCard": "Carta",
-  "buyData": "Dati"
+  "buyData": "Dati",
+  "estimatedDownloadSize": "Dimensione di download stimata",
+  "insufficientStorageWarning": "Spazio di archiviazione insufficiente per l'installazione. L'installazione potrebbe fallire."
 }
 

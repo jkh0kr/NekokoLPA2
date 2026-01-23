@@ -490,6 +490,8 @@
   "pending": "待處理",
   "manage": "管理",
   "buyCard": "卡片",
-  "buyData": "數據"
+  "buyData": "數據",
+  "estimatedDownloadSize": "預估下載大小",
+  "insufficientStorageWarning": "可用空間不足，安裝可能會失敗。"
 }
 

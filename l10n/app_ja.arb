@@ -661,5 +661,7 @@
         "type": "int"
       }
     }
-  }
+  },
+  "estimatedDownloadSize": "予想ダウンロードサイズ",
+  "insufficientStorageWarning": "空き容量が不足しているため、インストールが失敗する可能性があります。"
 }
