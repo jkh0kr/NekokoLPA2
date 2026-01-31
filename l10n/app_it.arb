@@ -342,7 +342,7 @@
   "permissionsRequired": "Permessi richiesti",
   "appCanSendNotif": "L'app può inviare notifiche di sistema",
   "requiredForReminders": "Richiesto per gli avvisi promemoria",
-  "unsupportedPlatformCheck": "Il controllo dei permessi non è supportato su questa piattaforma. Eseguire test manuali."
+  "unsupportedPlatformCheck": "Il controllo dei permessi non è supportato su questa piattaforma. Eseguire test manuali.",
   "couldNotVerifyStatus": "Impossibile verificare lo stato. Controllare le impostazioni manualmente.",
   "testNotificationTitle": "Notifica di test",
   "seconds": "secondi",
