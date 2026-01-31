@@ -693,5 +693,7 @@
     }
   },
   "estimatedDownloadSize": "Estimated download size",
-  "insufficientStorageWarning": "Insufficient storage for installation. Installation might fail."
+  "insufficientStorageWarning": "Insufficient storage for installation. Installation might fail.",
+  "estimateProfileSize": "Estimate Profile Size",
+  "estimateProfileSizeSubtitle": "Estimate size of profile metadata before download"
 }
