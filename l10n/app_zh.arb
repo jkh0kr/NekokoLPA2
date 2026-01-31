@@ -102,6 +102,7 @@
   "noDataLoaded": "未连接",
   "loadProfiles": "连接",
   "disconnect": "断开连接",
+  "disconnecting": "正在断开连接...",
   "profilesEmpty": "卡内无配置",
   "profilesEmptyMessage": "此 eUICC 卡是空的。",
   "renameProfile": "重命名配置",

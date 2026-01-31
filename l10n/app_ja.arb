@@ -103,6 +103,7 @@
   "noDataLoaded": "未接続",
   "loadProfiles": "接続",
   "disconnect": "切断",
+  "disconnecting": "切断中...",
   "profilesEmpty": "カード上にプロファイルがありません",
   "profilesEmptyMessage": "この eUICC カードは空です。",
   "renameProfile": "プロファイル名を変更",

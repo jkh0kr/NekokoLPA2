@@ -99,6 +99,7 @@
   "noDataLoaded": "No conectado",
   "loadProfiles": "Conectar",
   "disconnect": "Desconectar",
+  "disconnecting": "Desconectando...",
   "profilesEmpty": "Sin perfiles en la tarjeta",
   "profilesEmptyMessage": "Esta tarjeta eUICC está vacía.",
   "renameProfile": "Renombrar perfil",

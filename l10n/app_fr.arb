@@ -99,6 +99,7 @@
   "noDataLoaded": "Non connecté",
   "loadProfiles": "Connecter",
   "disconnect": "Déconnecter",
+  "disconnecting": "Déconnexion...",
   "profilesEmpty": "Aucun profil sur la carte",
   "profilesEmptyMessage": "Cette carte eUICC est vide.",
   "renameProfile": "Renommer le profil",
