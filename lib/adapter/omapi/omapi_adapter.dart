@@ -7,6 +7,37 @@ import '../../utils/hex_utils.dart';
 import '../../settings/app_settings.dart';
 import '../../utils/error_codes.dart';
 import '../../utils/apdu_exception.dart';
+import 'omapi_safety.dart';
+
+const Set<String> _estkSlotAids = {
+  'A06573746B6D65FFFF4953442D522030',
+  'A06573746B6D65FFFF4953442D522031',
+};
+
+List<String> omapiPreferredAidReuseCandidates(List<String> aids) {
+  if (aids.isEmpty) return aids;
+  final preferredAid = aids.first;
+  return _estkSlotAids.contains(preferredAid.toUpperCase())
+      ? [preferredAid]
+      : aids;
+}
+
+List<String> omapiNativeOpenCandidates(
+  List<String> aids,
+  Iterable<String> trackedAids,
+) {
+  if (aids.isEmpty) return aids;
+  final preferredAid = aids.first;
+  if (!_estkSlotAids.contains(preferredAid.toUpperCase())) {
+    return List<String>.from(aids);
+  }
+
+  final tracked = trackedAids.map((aid) => aid.toUpperCase()).toSet();
+  return [
+    preferredAid,
+    ...aids.skip(1).where((aid) => !tracked.contains(aid.toUpperCase())),
+  ];
+}
 
 class OmapiAdapter extends BaseAdapter {
   static final Logger _log = Logger('OmapiAdapter');
@@ -14,6 +45,12 @@ class OmapiAdapter extends BaseAdapter {
   static const EventChannel _eventChannel = EventChannel(
     'ee.nekoko.omapi_plugin/event',
   );
+  static final OmapiSafetyLatch _safety = OmapiSafetyLatch();
+
+  bool get isPoisoned => _safety.isPoisoned;
+
+  static Future<T> _invoke<T>(String method, [dynamic arguments]) =>
+      _safety.invoke<T>(_channel, method, arguments);
 
   Stream<Map<String, dynamic>> get simStateStream => _eventChannel
       .receiveBroadcastStream()
@@ -27,11 +64,52 @@ class OmapiAdapter extends BaseAdapter {
   final Map<String, int> _nextChannelIds = {};
   final Map<int, int> _refCounts = {};
   final Map<int, Timer> _pendingCloses = {};
+  final OmapiChannelOwnershipTracker _channelOwnership =
+      OmapiChannelOwnershipTracker();
+  bool _profileSwitchInProgress = false;
   List<Reader>? _lastReaders;
   DateTime? _lastListTime;
 
   final StreamController<EuiccPortState> _stateController =
       StreamController<EuiccPortState>.broadcast();
+
+  void _clearChannelTracking() {
+    _pendingCloses.forEach((_, timer) => timer.cancel());
+    _pendingCloses.clear();
+    _refCounts.clear();
+    _channelMappings.clear();
+    _channelOwnership.clear();
+  }
+
+  int _allocateInternalChannelId(String readerId) {
+    var candidate = _nextChannelIds[readerId] ?? 1;
+    for (var i = 0; i < 3; i++) {
+      final channelId = candidate;
+      candidate = (candidate % 3) + 1;
+      if (_channelOwnership.currentToken(channelId) == null) {
+        _nextChannelIds[readerId] = candidate;
+        return channelId;
+      }
+    }
+    throw AppException(
+      AppErrorCode.ERROR_OMAPI_CHANNEL_OPEN_FAILED,
+      message: 'No free OMAPI logical channel handle slots',
+    );
+  }
+
+  void _releasePlaceholder(int channelId, int? ownershipToken) {
+    if (!_channelOwnership.owns(channelId, ownershipToken)) return;
+    _refCounts[channelId] = (_refCounts[channelId] ?? 1) - 1;
+    if (_refCounts[channelId]! <= 0) {
+      _refCounts.remove(channelId);
+      _channelOwnership.releaseIfOwned(channelId, ownershipToken);
+    }
+  }
+
+  void _restoreReferenceIfOwned(int channelId, int? ownershipToken) {
+    if (!_channelOwnership.owns(channelId, ownershipToken)) return;
+    _refCounts[channelId] = (_refCounts[channelId] ?? 0) + 1;
+  }
 
   @override
   Stream<EuiccPortState> get stateStream => _stateController.stream;
@@ -57,7 +135,7 @@ class OmapiAdapter extends BaseAdapter {
     }
 
     try {
-      final List<dynamic> result = await _channel.invokeMethod('listReaders');
+      final List<dynamic> result = await _invoke('listReaders');
       final readers = result.map((nameStr) {
         final name = nameStr as String;
         String displayName = name;
@@ -76,6 +154,7 @@ class OmapiAdapter extends BaseAdapter {
       _lastListTime = now;
       return readers;
     } catch (e) {
+      if (isOmapiSessionCorruptedError(e)) rethrow;
       log.warning('Failed to list OMAPI readers: $e');
       return [];
     }
@@ -97,23 +176,27 @@ class OmapiAdapter extends BaseAdapter {
       log.info('Connecting to OMAPI reader: $realReaderName');
 
       try {
-        final Map<dynamic, dynamic> result = await _channel.invokeMethod(
-          'connect',
-          {'reader': realReaderName},
-        );
+        final Map<dynamic, dynamic> result = await _invoke('connect', {
+          'reader': realReaderName,
+        });
 
         _lastAtr = result['atr'] as String?;
         _nextChannelIds[realReaderName] = 1; // Reset channel counter on connect
         _stateController.add(EuiccPortState.open);
         log.info('Connected to OMAPI reader: $readerId');
-      } catch (e) {
+      } on PlatformException catch (e) {
+        if (isOmapiSessionCorruptedError(e)) rethrow;
         log.severe('Failed to connect to OMAPI reader: $e');
-        if (e is PlatformException && e.code == 'SecurityException') {
+        if (e.code == 'SecurityException') {
           throw AppException(
             AppErrorCode.ERROR_OMAPI_SECURITYEXCEPTION,
             originalError: e,
           );
         }
+        rethrow;
+      } catch (e) {
+        if (isOmapiSessionCorruptedError(e)) rethrow;
+        log.severe('Failed to connect to OMAPI reader: $e');
         rethrow;
       }
     });
@@ -124,24 +207,31 @@ class OmapiAdapter extends BaseAdapter {
     return await runExclusive(() async {
       if (_internalReaderName != null) {
         try {
-          // Close all open channels
+          // Close all open channels. Any unconfirmed close keeps local ownership intact.
           for (final aid in _channelMappings.values.toList()) {
             try {
-              await _channel.invokeMethod('closeChannel', {
+              await _invoke('closeChannel', {
                 'reader': _internalReaderName,
                 'aid': aid,
               });
             } catch (e) {
               log.warning('Failed to close channel $aid: $e');
+              rethrow;
             }
           }
-          _channelMappings.clear();
 
-          await _channel.invokeMethod('disconnect', {
-            'reader': _internalReaderName,
-          });
+          await _invoke('disconnect', {'reader': _internalReaderName});
+          _clearChannelTracking();
         } catch (e) {
           log.warning('Error during disconnect: $e');
+          if (isOmapiSessionCorruptedError(e)) {
+            _clearChannelTracking();
+            updateConnectedReader(null);
+            _internalReaderName = null;
+            _lastAtr = null;
+            _stateController.add(EuiccPortState.closed);
+          }
+          rethrow;
         }
 
         updateConnectedReader(null);
@@ -156,15 +246,14 @@ class OmapiAdapter extends BaseAdapter {
   Future<void> cleanupChannels() async {
     log.info('Ensuring single channel: closing all logical channels...');
     try {
-      _pendingCloses.forEach((_, timer) => timer.cancel());
-      _pendingCloses.clear();
-      _refCounts.clear();
-      await _channel.invokeMethod('closeChannels', {
-        'reader': _internalReaderName,
-      });
-      _channelMappings.clear();
+      await _invoke('closeChannels', {'reader': _internalReaderName});
+      _clearChannelTracking();
     } catch (e) {
       log.warning('Failed to close channels: $e');
+      if (isOmapiSessionCorruptedError(e)) {
+        _clearChannelTracking();
+      }
+      rethrow;
     }
     await Future.delayed(const Duration(milliseconds: 100));
   }
@@ -172,11 +261,13 @@ class OmapiAdapter extends BaseAdapter {
   @override
   Future<void> reconnect() async {
     return await runExclusive(() async {
+      _safety.ensureAvailable();
       log.info('Hard reconnect for OMAPI reader: $_internalReaderName');
       try {
-        await _channel.invokeMethod('reset');
+        await _invoke('reset');
       } catch (e) {
         log.warning('OMAPI reset failed: $e');
+        if (isOmapiSessionCorruptedError(e)) rethrow;
       }
       final reader = connectedReader;
       if (reader != null) {
@@ -205,7 +296,7 @@ class OmapiAdapter extends BaseAdapter {
     }
     final String apduHex = HexUtils.bytesToHex(apdu);
 
-    final String responseHex = await _channel.invokeMethod('transmit', {
+    final String responseHex = await _invoke('transmit', {
       'reader': _internalReaderName,
       'apdu': apduHex,
     });
@@ -226,11 +317,14 @@ class OmapiAdapter extends BaseAdapter {
       final readerId = _internalReaderName ?? "default";
 
       // 1. Check for same AID re-use
+      // For eSTK slots, only reuse the first AID requested by the caller.
       if (aids != null && aids.isNotEmpty) {
         log.info(
           'Checking for re-use. Targets: $aids. Current mappings: $_channelMappings',
         );
-        for (final aid in aids) {
+        final reuseCandidates = omapiPreferredAidReuseCandidates(aids);
+
+        for (final aid in reuseCandidates) {
           final existingId = _channelMappings.entries
               .firstWhereOrNull(
                 (e) => e.value.toUpperCase() == aid.toUpperCase(),
@@ -238,13 +332,21 @@ class OmapiAdapter extends BaseAdapter {
               ?.key;
 
           if (existingId != null) {
+            final ownershipToken = _channelOwnership.currentToken(existingId);
+            if (ownershipToken == null) {
+              throw AppException(
+                AppErrorCode.ERROR_OMAPI_CHANNEL_OPEN_FAILED,
+                message:
+                    'Tracked OMAPI channel $existingId for AID $aid has no current owner',
+              );
+            }
             _pendingCloses[existingId]?.cancel();
             _pendingCloses.remove(existingId);
             _refCounts[existingId] = (_refCounts[existingId] ?? 0) + 1;
             log.info(
               'Reusing existing logical channel $existingId for AID $aid (refs: ${_refCounts[existingId]})',
             );
-            return _OmapiChannel(this, existingId, aid);
+            return _OmapiChannel(this, existingId, aid, ownershipToken);
           }
         }
       }
@@ -262,23 +364,34 @@ class OmapiAdapter extends BaseAdapter {
           );
         }
       }
-      final internalId = _nextChannelIds[readerId] ?? 1;
-      _nextChannelIds[readerId] = (internalId % 3) + 1;
+      final internalId = _allocateInternalChannelId(readerId);
       if (aids != null && aids.isNotEmpty) {
         try {
-          final result = await _channel.invokeMethod('openChannel', {
+          final nativeAids = omapiNativeOpenCandidates(
+            aids,
+            _channelMappings.values,
+          );
+          final result = await _invoke('openChannel', {
             'reader': _internalReaderName,
-            'aids': aids,
+            'aids': nativeAids,
           });
           final resultMap = (result is Map) ? result : {'success': true};
           final String? selectedAid = resultMap['aid'] as String?;
           if (selectedAid != null) {
             _channelMappings[internalId] = selectedAid;
+            final ownershipToken = _channelOwnership.claim(internalId);
             _refCounts[internalId] = (_refCounts[internalId] ?? 0) + 1;
-            return _OmapiChannel(this, internalId, selectedAid);
+            return _OmapiChannel(this, internalId, selectedAid, ownershipToken);
           }
         } catch (e) {
           log.warning('Native scan failed: $e');
+          if (isOmapiSessionCorruptedError(e)) {
+            throw AppException(
+              AppErrorCode.ERROR_OMAPI_SESSION_CORRUPTED,
+              message: omapiRebootRequiredMessage,
+              originalError: e,
+            );
+          }
           if (e is PlatformException &&
               (e.code == 'AccessControlException' ||
                   e.message == 'no APDU access allowed')) {
@@ -295,13 +408,20 @@ class OmapiAdapter extends BaseAdapter {
         }
       }
       log.info('Creating deferred logical channel placeholder: $internalId');
+      final ownershipToken = _channelOwnership.claim(internalId);
       _refCounts[internalId] = (_refCounts[internalId] ?? 0) + 1;
-      return _OmapiChannel(this, internalId, null);
+      return _OmapiChannel(this, internalId, null, ownershipToken);
     });
   }
 
-  Future<Uint8List> _transmitOnChannel(String aidHex, Uint8List apdu) async {
+  Future<Uint8List> _transmitOnChannel(
+    String aidHex,
+    Uint8List apdu,
+    int channelId,
+    int? ownershipToken,
+  ) async {
     return await runExclusive(() async {
+      _channelOwnership.ensureOwned(channelId, ownershipToken);
       if (_internalReaderName == null) {
         throw AppException(
           AppErrorCode.ERROR_OMAPI_READER_NOT_AVAILABLE,
@@ -311,10 +431,11 @@ class OmapiAdapter extends BaseAdapter {
       final String apduHex = HexUtils.bytesToHex(apdu);
 
       try {
-        final String responseHex = await _channel.invokeMethod(
-          'transmitOnChannel',
-          {'reader': _internalReaderName, 'aid': aidHex, 'apdu': apduHex},
-        );
+        final String responseHex = await _invoke('transmitOnChannel', {
+          'reader': _internalReaderName,
+          'aid': aidHex,
+          'apdu': apduHex,
+        });
 
         return HexUtils.hexToBytes(responseHex);
       } catch (e) {
@@ -328,15 +449,35 @@ class OmapiAdapter extends BaseAdapter {
     });
   }
 
-  Future<void> _requestCloseChannel(int channelId, String aidHex) async {
+  Future<void> _requestCloseChannel(
+    int channelId,
+    String aidHex,
+    int? ownershipToken, {
+    bool immediate = false,
+  }) async {
+    if (!_channelOwnership.owns(channelId, ownershipToken)) {
+      log.info(
+        'Ignoring stale close for channel $channelId / AID $aidHex: ownership changed',
+      );
+      return;
+    }
+
     _refCounts[channelId] = (_refCounts[channelId] ?? 1) - 1;
     if (_refCounts[channelId]! <= 0) {
+      if (_profileSwitchInProgress || immediate) {
+        await _finalizeCloseChannel(channelId, aidHex, ownershipToken);
+        return;
+      }
       log.info(
         'Channel $channelId close request pending: delaying 3s for AID $aidHex...',
       );
       _pendingCloses[channelId]?.cancel();
       _pendingCloses[channelId] = Timer(const Duration(seconds: 3), () async {
-        await _finalizeCloseChannel(channelId, aidHex);
+        try {
+          await _finalizeCloseChannel(channelId, aidHex, ownershipToken);
+        } catch (e) {
+          log.severe('Deferred channel close failed: $e');
+        }
         _pendingCloses.remove(channelId);
       });
     } else {
@@ -346,12 +487,22 @@ class OmapiAdapter extends BaseAdapter {
     }
   }
 
-  Future<void> _finalizeCloseChannel(int channelId, String aidHex) async {
+  Future<void> _finalizeCloseChannel(
+    int channelId,
+    String aidHex,
+    int? ownershipToken,
+  ) async {
     return await runExclusive(() async {
       if (_internalReaderName == null) return;
+      if (!_channelOwnership.owns(channelId, ownershipToken)) {
+        log.info(
+          'Skipping stale finalized close for channel $channelId / AID $aidHex',
+        );
+        return;
+      }
 
       try {
-        await _channel.invokeMethod('closeChannel', {
+        await _invoke('closeChannel', {
           'reader': _internalReaderName,
           'aid': aidHex,
         });
@@ -360,26 +511,51 @@ class OmapiAdapter extends BaseAdapter {
         );
       } catch (e) {
         log.warning('Failed to close channel for $aidHex: $e');
-      } finally {
+        if (isOmapiSessionCorruptedError(e)) {
+          _clearChannelTracking();
+        }
+        rethrow;
+      }
+
+      if (_channelOwnership.releaseIfOwned(channelId, ownershipToken)) {
         _channelMappings.remove(channelId);
+        _refCounts.remove(channelId);
       }
     });
+  }
+
+  void _ensureAidNotOwnedByAnotherChannel(String aidHex, int channelId) {
+    final existing = _channelMappings.entries.firstWhereOrNull(
+      (entry) =>
+          entry.key != channelId &&
+          entry.value.toUpperCase() == aidHex.toUpperCase(),
+    );
+    if (existing != null) {
+      throw AppException(
+        AppErrorCode.ERROR_OMAPI_CHANNEL_OPEN_FAILED,
+        message:
+            'AID $aidHex is already owned by logical channel ${existing.key}',
+      );
+    }
   }
 
   Future<Map<dynamic, dynamic>> _openChannelInKotlin(
     String aidHex,
     int channelId,
+    int? ownershipToken,
   ) async {
     return await runExclusive(() async {
+      _channelOwnership.ensureOwned(channelId, ownershipToken);
       if (_internalReaderName == null) {
         throw AppException(
           AppErrorCode.ERROR_OMAPI_READER_NOT_AVAILABLE,
           message: 'Not connected to reader',
         );
       }
+      _ensureAidNotOwnedByAnotherChannel(aidHex, channelId);
 
       try {
-        final result = await _channel.invokeMethod('openChannel', {
+        final result = await _invoke('openChannel', {
           'reader': _internalReaderName,
           'aid': aidHex,
         });
@@ -388,26 +564,43 @@ class OmapiAdapter extends BaseAdapter {
         // Small delay for SE stability after select
         await Future.delayed(const Duration(milliseconds: 50));
 
-        if (result is bool) return {"success": result};
-        return result as Map<dynamic, dynamic>;
+        final resultMap = result is bool
+            ? <dynamic, dynamic>{"success": result}
+            : Map<dynamic, dynamic>.from(result as Map);
+        resultMap['_ownershipToken'] = ownershipToken;
+        return resultMap;
       } catch (e) {
-        // If first attempt fails, try heavy cleanup and retry once
+        if (isOmapiSessionCorruptedError(e)) rethrow;
+        // If first attempt fails, try heavy cleanup and retry once.
         log.warning(
           'Initial openChannel for $aidHex failed ($e). Retrying after cleanup...',
         );
+        int? retryOwnershipToken;
         try {
           await cleanupChannels();
-          final result = await _channel.invokeMethod('openChannel', {
+          retryOwnershipToken = _channelOwnership.claim(channelId);
+          _refCounts[channelId] = 1;
+          _ensureAidNotOwnedByAnotherChannel(aidHex, channelId);
+          final result = await _invoke('openChannel', {
             'reader': _internalReaderName,
             'aid': aidHex,
           });
           _channelMappings[channelId] = aidHex;
           await Future.delayed(const Duration(milliseconds: 50));
 
-          if (result is bool) return {"success": result};
-          return result as Map<dynamic, dynamic>;
+          final resultMap = result is bool
+              ? <dynamic, dynamic>{"success": result}
+              : Map<dynamic, dynamic>.from(result as Map);
+          resultMap['_ownershipToken'] = retryOwnershipToken;
+          return resultMap;
         } catch (retryE) {
+          if (retryOwnershipToken != null &&
+              !_channelMappings.containsKey(channelId)) {
+            _channelOwnership.releaseIfOwned(channelId, retryOwnershipToken);
+            _refCounts.remove(channelId);
+          }
           log.severe('Retry openChannel failed for $aidHex: $retryE');
+          if (isOmapiSessionCorruptedError(retryE)) rethrow;
           if (retryE is PlatformException &&
               (retryE.code == 'AccessControlException' ||
                   retryE.message == 'no APDU access allowed')) {
@@ -438,16 +631,39 @@ class OmapiAdapter extends BaseAdapter {
       },
     );
   }
+
+  @override
+  Future<void> setProfileSwitchInProgress(bool value) async {
+    // This marker is local metadata, not an OMAPI operation, so it remains callable after poison.
+    await _channel.invokeMethod('setProfileSwitchInProgress', {'value': value});
+    _profileSwitchInProgress = value;
+  }
 }
 
 class _OmapiChannel extends BaseChannel {
   final OmapiAdapter _adapter;
   final int _internalId;
   String? _aidHex;
+  int? _ownershipToken;
   Uint8List? _lastSelectResponse;
+  bool _closed = false;
 
-  _OmapiChannel(this._adapter, this._internalId, this._aidHex)
-    : super(_adapter, _internalId);
+  _OmapiChannel(
+    this._adapter,
+    this._internalId,
+    this._aidHex,
+    this._ownershipToken,
+  ) : super(_adapter, _internalId);
+
+  void _ensureUsable() {
+    if (_closed) {
+      throw AppException(
+        AppErrorCode.ERROR_OMAPI_CHANNEL_OPEN_FAILED,
+        message: 'OMAPI channel handle $_internalId is already closed',
+      );
+    }
+    _adapter._channelOwnership.ensureOwned(_internalId, _ownershipToken);
+  }
 
   @override
   int get channelNumber => _internalId;
@@ -457,15 +673,35 @@ class _OmapiChannel extends BaseChannel {
 
   @override
   Future<void> close() async {
-    if (_aidHex != null) {
-      await _adapter._requestCloseChannel(_internalId, _aidHex!);
+    if (_closed) return;
+    if (_aidHex == null) {
+      _adapter._releasePlaceholder(_internalId, _ownershipToken);
+      _closed = true;
+      return;
+    }
+    try {
+      await _adapter._requestCloseChannel(
+        _internalId,
+        _aidHex!,
+        _ownershipToken,
+      );
+      _closed = true;
+    } catch (_) {
+      _adapter._restoreReferenceIfOwned(_internalId, _ownershipToken);
+      rethrow;
     }
   }
 
   @override
   Future<Uint8List> sendRawApdu(Uint8List apdu) async {
+    _ensureUsable();
     if (_aidHex == null) throw Exception('AID not selected');
-    return await _adapter._transmitOnChannel(_aidHex!, apdu);
+    return await _adapter._transmitOnChannel(
+      _aidHex!,
+      apdu,
+      _internalId,
+      _ownershipToken,
+    );
   }
 
   @override
@@ -477,6 +713,8 @@ class _OmapiChannel extends BaseChannel {
     Uint8List? data,
     int? le,
   ]) async {
+    _ensureUsable();
+
     // If SELECT AID (INS=A4, P1=04)
     if (ins == 0xA4 && p1 == 0x04 && data != null) {
       final targetAid = HexUtils.bytesToHex(data);
@@ -484,16 +722,34 @@ class _OmapiChannel extends BaseChannel {
       // If we already have a channel open but for a DIFFERENT aid, we must switch.
       // Logical channels are usually pinned to the AID they were opened with.
       if (_aidHex != null && _aidHex != targetAid) {
+        if ((_adapter._refCounts[_internalId] ?? 1) > 1) {
+          throw AppException(
+            AppErrorCode.ERROR_OMAPI_CHANNEL_OPEN_FAILED,
+            message:
+                'Cannot switch AID on shared OMAPI channel $_internalId; open a separate channel instead',
+          );
+        }
         _adapter.log.info(
           'OMAPI: Switching AID from $_aidHex to $targetAid (closing old channel placeholder)',
         );
         try {
-          // Instead of full close which removing mapping, we just reset it locally and let re-open happen
-          await _adapter._requestCloseChannel(_internalId, _aidHex!);
+          // The old ownership must be retired before this handle claims the new AID.
+          await _adapter._requestCloseChannel(
+            _internalId,
+            _aidHex!,
+            _ownershipToken,
+            immediate: true,
+          );
+          final replacementToken = _adapter._channelOwnership.claim(
+            _internalId,
+          );
           _aidHex = null;
+          _ownershipToken = replacementToken;
+          _adapter._refCounts[_internalId] = 1;
         } catch (e) {
+          _adapter._restoreReferenceIfOwned(_internalId, _ownershipToken);
           _adapter.log.warning('Failed to close old channel during switch: $e');
-          _aidHex = null; // Proceed anyway
+          rethrow;
         }
       }
 
@@ -506,8 +762,10 @@ class _OmapiChannel extends BaseChannel {
           final result = await _adapter._openChannelInKotlin(
             targetAid,
             _internalId,
+            _ownershipToken,
           );
           _aidHex = targetAid;
+          _ownershipToken = result['_ownershipToken'] as int?;
 
           // Return the actual select response if provided by plugin
           final String? selectResp = result['selectResponse'];
@@ -540,8 +798,10 @@ class _OmapiChannel extends BaseChannel {
           'Recovery trigger for error (lost=true) on AID $_aidHex, cleaning up and re-opening...',
         );
         try {
-          // Simple re-open if just channel lost
-          await OmapiAdapter._channel.invokeMethod('openChannel', {
+          _ensureUsable();
+          _adapter._ensureAidNotOwnedByAnotherChannel(_aidHex!, _internalId);
+          // Simple re-open if just channel lost. The same handle keeps ownership.
+          await OmapiAdapter._invoke('openChannel', {
             'reader': _adapter._internalReaderName,
             'aid': _aidHex,
           });
@@ -550,6 +810,7 @@ class _OmapiChannel extends BaseChannel {
           // Otherwise just retry the raw transmission
           return await super.transmit(cla, ins, p1, p2, data, le);
         } catch (recoveryErr) {
+          if (isOmapiSessionCorruptedError(recoveryErr)) rethrow;
           _adapter.log.warning(
             'Failed to recover from error on AID $_aidHex: $recoveryErr',
           );
